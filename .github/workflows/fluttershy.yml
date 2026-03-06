@@ -2,8 +2,8 @@ name: Fluttershy 24/7
 
 on:
   schedule:
-    - cron: "*/5 * * * *"  # Runs every 5 minutes
-  workflow_dispatch:  # Manual trigger
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
   push:
     branches: [ main ]
 
@@ -12,16 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      
+
       - name: Install dependencies
         run: |
           pip install discord.py groq
-      
-      - name: Run Fluttershy Forever
+
+      - name: Kill any old bot processes
+        run: |
+          pkill -f "python fluttershy_bot.py" || true
+
+      - name: Run Fluttershy
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           MAIN_API_KEY: ${{ secrets.MAIN_API_KEY }}
@@ -29,16 +33,6 @@ jobs:
         run: |
           while true; do
             python fluttershy_bot.py
-            echo "💕 Fluttershy restarting in 10 seconds..."
+            echo "💕 Restarting in 10..."
             sleep 10
           done
-      
-      - name: Keep alive commit (optional)
-        run: |
-          git config --global user.name "fluttershy-bot"
-          git config --global user.email "fluttershy@users.noreply.github.com"
-          date > .fluttershy_heartbeat
-          git add .fluttershy_heartbeat
-          git diff-index --quiet HEAD || git commit -m "💕 flutter $(date +%s)"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} HEAD:main
-        continue-on-error: true
