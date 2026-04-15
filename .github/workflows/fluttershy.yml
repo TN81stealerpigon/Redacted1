@@ -1,90 +1,93 @@
-name: Full Emergency Purge (No PAT Version)
+name: Vex 24/7
 
 on:
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: vex-bot-single-instance
+  cancel-in-progress: true
 
 jobs:
-  purge:
+  run-vex:
     runs-on: ubuntu-latest
-    permissions:
-      actions: write   # This is the key — gives the default token deletion rights
+    timeout-minutes: 360
 
     steps:
-      - name: Delete ALL artifacts using default token
-        uses: actions/github-script@v7
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          script: |
-            console.log("=== Starting Artifact Purge (no PAT) ===");
-            const artifacts = await github.paginate(
-              github.rest.actions.listArtifactsForRepo,
-              { 
-                owner: context.repo.owner, 
-                repo: context.repo.repo 
-              }
-            );
+          python-version: '3.12'
 
-            if (artifacts.length === 0) {
-              console.log("✅ No artifacts found.");
-            } else {
-              console.log(`Found ${artifacts.length} artifacts. Deleting...`);
-              for (const art of artifacts) {
-                console.log(`Deleting: ${art.name} (${art.size_in_bytes || 0} bytes)`);
-                try {
-                  await github.rest.actions.deleteArtifact({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    artifact_id: art.id
-                  });
-                  console.log(`✓ Deleted ${art.name}`);
-                } catch (e) {
-                  console.log(`✗ Failed to delete ${art.name}: ${e.message}`);
-                }
-                await new Promise(r => setTimeout(r, 400)); // Be gentle on rate limits
-              }
-              console.log("Artifact deletion step finished.");
-            }
+      - name: Install dependencies
+        run: pip install --no-cache-dir discord.py groq aiohttp google-genai aiofiles
 
-      - name: Delete ALL caches using gh CLI
+      - name: Write bot file
         env:
-          GH_TOKEN: ${{ github.token }}   # Use the default token
-        run: |
-          echo "=== Starting Cache Purge ==="
-          CACHE_IDS=$(gh cache list --repo ${{ github.repository }} --limit 1000 --json id -q '.[].id' || echo "")
-          if [ -n "$CACHE_IDS" ]; then
-            echo "Found caches. Deleting..."
-            for id in $CACHE_IDS; do
-              echo "Deleting cache $id"
-              gh cache delete $id --repo ${{ github.repository }} || true
-              sleep 0.4
-            done
-            echo "Cache purge finished."
-          else
-            echo "No caches found."
-          fi
+          BOT_CODE: ${{ secrets.BOT_CODE }}
+        run: printf '%s\n' "$BOT_CODE" > vex_bot.py
 
-      - name: Delete as many workflow runs as possible
+      - name: Run Vex
+        env:
+          DISCORD_TOKEN:  ${{ secrets.DISCORD_TOKEN }}
+          MAIN_API_KEY:   ${{ secrets.MAIN_API_KEY }}
+          SUMM_API_KEY:   ${{ secrets.SUMM_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          [ -z "$DISCORD_TOKEN" ] && { echo "DISCORD_TOKEN missing"; exit 1; }
+
+          python vex_bot.py &
+          BOT_PID=$!
+
+          sleep 12
+          kill -0 $BOT_PID 2>/dev/null || { echo "Bot failed to start"; exit 1; }
+          echo "Vex running (PID $BOT_PID)"
+
+          trap '
+            kill -TERM $BOT_PID 2>/dev/null || true
+            sleep 5
+            kill -KILL $BOT_PID 2>/dev/null || true
+            wait $BOT_PID 2>/dev/null || true
+            exit 0
+          ' TERM INT
+
+          wait $BOT_PID
+
+      - name: Clean up old runs
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "=== Trying to delete workflow runs ==="
-          echo "Note: This may skip some (especially in-progress or the current run)."
+          CURRENT=${{ github.run_id }}
+          echo "Cleaning up old Vex runs..."
 
-          RUN_IDS=$(gh run list --repo ${{ github.repository }} \
-            --limit 1000 \
-            --json databaseId \
-            -q '.[].databaseId' || echo "")
+          run_ids=$(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/actions/workflows/vex.yml/runs" \
+            --jq '.workflow_runs[] | select(.status == "completed" or .status == "failure" or .status == "cancelled") | .id')
 
-          if [ -z "$RUN_IDS" ]; then
-            echo "No runs found to delete."
-          else
-            COUNT=0
-            for id in $RUN_IDS; do
-              echo "Attempting to delete run $id"
-              gh run delete $id --repo ${{ github.repository }} || echo "Skipped run $id (may be protected or current run)"
-              COUNT=$((COUNT + 1))
-              sleep 0.5
-            done
-            echo "Processed $COUNT runs."
+          if [ -z "$run_ids" ]; then
+            echo "No runs to clean."
+            exit 0
           fi
 
-          echo "Purge completed. Refresh the Actions tab and check Settings → Billing in 6-48 hours."
+          for id in $run_ids; do
+            [ "$id" = "$CURRENT" ] && continue
+            echo "Deleting run $id..."
+            gh api \
+              -X DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/actions/runs/$id" || echo "Failed to delete $id"
+            sleep 0.4
+          done
+
+          echo "Cleanup done"
