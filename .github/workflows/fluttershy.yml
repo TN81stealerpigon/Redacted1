@@ -1,55 +1,83 @@
-name: Emergency Purge All Artifacts
+name: Full Emergency Purge - Artifacts + Caches + ALL Workflow Runs
 
 on:
-  workflow_dispatch:   # Trigger manually from Actions tab
+  workflow_dispatch:   # Run manually only
 
 jobs:
-  purge:
+  full-purge:
     runs-on: ubuntu-latest
     permissions:
       actions: write
 
     steps:
-      - name: Delete ALL artifacts (bulk purge)
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}   # Must have repo scope
+      - name: Delete ALL artifacts
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.PAT }}
           script: |
-            console.log("Fetching all artifacts... This may take time if you have hundreds.");
-
+            console.log("=== Starting Artifact Purge ===");
             const artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
-              {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                per_page: 100
-              }
+              { owner: context.repo.owner, repo: context.repo.repo }
             );
 
             if (artifacts.length === 0) {
-              console.log("No artifacts found. Nothing to delete.");
-              return;
-            }
-
-            console.log(`Found ${artifacts.length} artifacts. Starting deletion...`);
-
-            for (const artifact of artifacts) {
-              console.log(`Deleting artifact: ${artifact.name} (ID: ${artifact.id}, Size: ${artifact.size_in_bytes} bytes)`);
-              
-              try {
+              console.log("No artifacts found.");
+            } else {
+              console.log(`Found ${artifacts.length} artifacts. Deleting...`);
+              for (const art of artifacts) {
+                console.log(`Deleting artifact: ${art.name} (${art.size_in_bytes} bytes)`);
                 await github.rest.actions.deleteArtifact({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  artifact_id: artifact.id
+                  artifact_id: art.id
                 });
-                console.log(`✓ Deleted ${artifact.name}`);
-              } catch (error) {
-                console.error(`✗ Failed to delete ${artifact.name}: ${error.message}`);
+                await new Promise(r => setTimeout(r, 250)); // Avoid rate limits
               }
-              
-              // Small delay to avoid rate limits
-              await new Promise(resolve => setTimeout(resolve, 300));
+              console.log("All artifacts deleted.");
             }
 
-            console.log("Artifact purge completed! Check usage in a few hours.");
+      - name: Delete ALL caches
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "=== Starting Cache Purge ==="
+          CACHE_IDS=$(gh cache list --repo ${{ github.repository }} --limit 1000 --json id -q '.[].id' || echo "")
+          if [ -n "$CACHE_IDS" ]; then
+            echo "Found caches. Deleting..."
+            for id in $CACHE_IDS; do
+              echo "Deleting cache ID: $id"
+              gh cache delete $id --repo ${{ github.repository }} || true
+            done
+          else
+            echo "No caches found."
+          fi
+
+      - name: Delete ALL workflow runs (this also clears logs + any remaining artifacts)
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}
+        run: |
+          echo "=== Starting Workflow Run Purge ==="
+          echo "This will delete EVERY run (including this one after it finishes)."
+
+          # Get all run IDs (completed, in_progress, etc.)
+          RUN_IDS=$(gh run list --repo ${{ github.repository }} \
+            --limit 1000 \
+            --json databaseId \
+            -q '.[].databaseId' || echo "")
+
+          if [ -z "$RUN_IDS" ]; then
+            echo "No runs found."
+          else
+            echo "Found runs to delete. Starting bulk deletion..."
+            COUNT=0
+            for id in $RUN_IDS; do
+              echo "Deleting run ID: $id"
+              gh run delete $id --repo ${{ github.repository }} || echo "Failed to delete $id (may already be gone)"
+              COUNT=$((COUNT + 1))
+              sleep 0.3  # Gentle on rate limits
+            done
+            echo "Deleted $COUNT workflow runs."
+          fi
+
+          echo "Full purge completed. Check storage in Settings → Billing (may take 6-48 hours to update)."
