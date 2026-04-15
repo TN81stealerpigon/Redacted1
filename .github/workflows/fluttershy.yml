@@ -1,7 +1,7 @@
 name: Full Emergency Purge - Artifacts + Caches + ALL Workflow Runs
 
 on:
-  workflow_dispatch:   # Run manually only
+  workflow_dispatch:
 
 jobs:
   full-purge:
@@ -16,7 +16,7 @@ jobs:
           github-token: ${{ secrets.PAT }}
           script: |
             console.log("=== Starting Artifact Purge ===");
-            const artifacts = await github.paginate(
+            let artifacts = await github.paginate(
               github.rest.actions.listArtifactsForRepo,
               { owner: context.repo.owner, repo: context.repo.repo }
             );
@@ -26,15 +26,19 @@ jobs:
             } else {
               console.log(`Found ${artifacts.length} artifacts. Deleting...`);
               for (const art of artifacts) {
-                console.log(`Deleting artifact: ${art.name} (${art.size_in_bytes} bytes)`);
-                await github.rest.actions.deleteArtifact({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  artifact_id: art.id
-                });
-                await new Promise(r => setTimeout(r, 250)); // Avoid rate limits
+                console.log(`Deleting: ${art.name} (${art.size_in_bytes} bytes)`);
+                try {
+                  await github.rest.actions.deleteArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: art.id
+                  });
+                } catch (e) {
+                  console.log(`Failed ${art.name}: ${e.message}`);
+                }
+                await new Promise(r => setTimeout(r, 300));
               }
-              console.log("All artifacts deleted.");
+              console.log("All artifacts processed.");
             }
 
       - name: Delete ALL caches
@@ -44,23 +48,23 @@ jobs:
           echo "=== Starting Cache Purge ==="
           CACHE_IDS=$(gh cache list --repo ${{ github.repository }} --limit 1000 --json id -q '.[].id' || echo "")
           if [ -n "$CACHE_IDS" ]; then
-            echo "Found caches. Deleting..."
             for id in $CACHE_IDS; do
-              echo "Deleting cache ID: $id"
+              echo "Deleting cache $id"
               gh cache delete $id --repo ${{ github.repository }} || true
+              sleep 0.3
             done
+            echo "Caches processed."
           else
             echo "No caches found."
           fi
 
-      - name: Delete ALL workflow runs (this also clears logs + any remaining artifacts)
+      - name: Delete ALL workflow runs (clears logs + remaining artifacts)
         env:
           GITHUB_TOKEN: ${{ secrets.PAT }}
         run: |
           echo "=== Starting Workflow Run Purge ==="
-          echo "This will delete EVERY run (including this one after it finishes)."
+          echo "This will delete every run (including this one after it finishes)."
 
-          # Get all run IDs (completed, in_progress, etc.)
           RUN_IDS=$(gh run list --repo ${{ github.repository }} \
             --limit 1000 \
             --json databaseId \
@@ -69,15 +73,14 @@ jobs:
           if [ -z "$RUN_IDS" ]; then
             echo "No runs found."
           else
-            echo "Found runs to delete. Starting bulk deletion..."
             COUNT=0
             for id in $RUN_IDS; do
-              echo "Deleting run ID: $id"
-              gh run delete $id --repo ${{ github.repository }} || echo "Failed to delete $id (may already be gone)"
+              echo "Deleting run $id"
+              gh run delete $id --repo ${{ github.repository }} || echo "Failed (already gone)"
               COUNT=$((COUNT + 1))
-              sleep 0.3  # Gentle on rate limits
+              sleep 0.4
             done
-            echo "Deleted $COUNT workflow runs."
+            echo "Deleted $COUNT runs."
           fi
 
-          echo "Full purge completed. Check storage in Settings → Billing (may take 6-48 hours to update)."
+          echo "Full purge finished on backend. Refresh Billing page in 6-48 hours."
