@@ -1,93 +1,55 @@
-name: Vex 24/7
+name: Emergency Purge All Artifacts
 
 on:
-  schedule:
-    - cron: "0 */6 * * *"
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
-permissions:
-  actions: write
-  contents: write
-
-concurrency:
-  group: vex-bot-single-instance
-  cancel-in-progress: true
+  workflow_dispatch:   # Trigger manually from Actions tab
 
 jobs:
-  run-vex:
+  purge:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    permissions:
+      actions: write
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Delete ALL artifacts (bulk purge)
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT }}   # Must have repo scope
+        uses: actions/github-script@v7
         with:
-          python-version: '3.12'
+          script: |
+            console.log("Fetching all artifacts... This may take time if you have hundreds.");
 
-      - name: Install dependencies
-        run: pip install --no-cache-dir discord.py groq aiohttp google-genai aiofiles
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
 
-      - name: Write bot file
-        env:
-          BOT_CODE: ${{ secrets.BOT_CODE }}
-        run: printf '%s\n' "$BOT_CODE" > vex_bot.py
+            if (artifacts.length === 0) {
+              console.log("No artifacts found. Nothing to delete.");
+              return;
+            }
 
-      - name: Run Vex
-        env:
-          DISCORD_TOKEN:  ${{ secrets.DISCORD_TOKEN }}
-          MAIN_API_KEY:   ${{ secrets.MAIN_API_KEY }}
-          SUMM_API_KEY:   ${{ secrets.SUMM_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          [ -z "$DISCORD_TOKEN" ] && { echo "DISCORD_TOKEN missing"; exit 1; }
+            console.log(`Found ${artifacts.length} artifacts. Starting deletion...`);
 
-          python vex_bot.py &
-          BOT_PID=$!
+            for (const artifact of artifacts) {
+              console.log(`Deleting artifact: ${artifact.name} (ID: ${artifact.id}, Size: ${artifact.size_in_bytes} bytes)`);
+              
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id
+                });
+                console.log(`✓ Deleted ${artifact.name}`);
+              } catch (error) {
+                console.error(`✗ Failed to delete ${artifact.name}: ${error.message}`);
+              }
+              
+              // Small delay to avoid rate limits
+              await new Promise(resolve => setTimeout(resolve, 300));
+            }
 
-          sleep 12
-          kill -0 $BOT_PID 2>/dev/null || { echo "Bot failed to start"; exit 1; }
-          echo "Vex running (PID $BOT_PID)"
-
-          trap '
-            kill -TERM $BOT_PID 2>/dev/null || true
-            sleep 5
-            kill -KILL $BOT_PID 2>/dev/null || true
-            wait $BOT_PID 2>/dev/null || true
-            exit 0
-          ' TERM INT
-
-          wait $BOT_PID
-
-      - name: Clean up old runs
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          CURRENT=${{ github.run_id }}
-          echo "Cleaning up old Vex runs..."
-
-          run_ids=$(gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$REPO/actions/workflows/vex.yml/runs" \
-            --jq '.workflow_runs[] | select(.status == "completed" or .status == "failure" or .status == "cancelled") | .id')
-
-          if [ -z "$run_ids" ]; then
-            echo "No runs to clean."
-            exit 0
-          fi
-
-          for id in $run_ids; do
-            [ "$id" = "$CURRENT" ] && continue
-            echo "Deleting run $id..."
-            gh api \
-              -X DELETE \
-              -H "Accept: application/vnd.github+json" \
-              "/repos/$REPO/actions/runs/$id" || echo "Failed to delete $id"
-            sleep 0.4
-          done
-
-          echo "Cleanup done"
+            console.log("Artifact purge completed! Check usage in a few hours.");
